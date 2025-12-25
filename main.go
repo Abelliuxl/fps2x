@@ -45,6 +45,9 @@ var (
 	stepExtractLabel *widget.Label
 	stepInterpLabel  *widget.Label
 	stepMergeLabel   *widget.Label
+
+	// 模式选择
+	outputMode       string // "2x" 或 "60fps"
 )
 
 type ProcessingStep int
@@ -72,8 +75,11 @@ type BinaryPaths struct {
 func main() {
 	myApp := app.NewWithID("com.fps2x.desktop")
 
+	// 初始化默认模式
+	outputMode = "2x"
+
 	mainWindow = myApp.NewWindow("FPS2X - 视频帧率倍增器")
-	mainWindow.Resize(fyne.NewSize(600, 620))
+	mainWindow.Resize(fyne.NewSize(600, 650)) // 稍微减小高度
 	mainWindow.CenterOnScreen()
 
 	// 创建 UI
@@ -87,15 +93,6 @@ func main() {
 }
 
 func createUI() *fyne.Container {
-	// 标题
-	title := widget.NewLabel("FPS2X")
-	title.TextStyle = fyne.TextStyle{Bold: true}
-	title.Alignment = fyne.TextAlignCenter
-
-	subtitle := widget.NewLabel("视频帧率倍增器")
-	subtitle.TextStyle = fyne.TextStyle{Italic: true}
-	subtitle.Alignment = fyne.TextAlignCenter
-
 	// 文件状态卡片（大图标显示 - 4倍大小）
 	largeFontSize := float32(48) // 约4倍正常字体大小
 	fileIconCanvas = canvas.NewText("❓", color.White)
@@ -124,6 +121,24 @@ func createUI() *fyne.Container {
 	fileLabel.Alignment = fyne.TextAlignCenter
 	fileLabel.Wrapping = fyne.TextWrapWord
 	fileLabel.Hide() // 现在始终显示卡片
+
+	// 输出模式选择
+	modeTitle := widget.NewLabel("输出帧率模式")
+	modeTitle.TextStyle = fyne.TextStyle{Bold: true}
+
+	modeSelect := widget.NewRadioGroup([]string{"2倍帧率（高质量）", "固定60帧（通用）"}, func(s string) {
+		if s == "2倍帧率（高质量）" {
+			outputMode = "2x"
+		} else {
+			outputMode = "60fps"
+		}
+	})
+	modeSelect.Horizontal = true // 横向排列
+	modeSelect.Selected = "2倍帧率（高质量）" // 默认选中第一个
+
+	modeBox := container.NewVBox(
+		modeSelect,
+	)
 
 	// 按钮区域 - 横向布局但不占满宽度
 	selectBtn = widget.NewButton("选择视频文件", onSelectFile)
@@ -172,14 +187,14 @@ func createUI() *fyne.Container {
 
 	// 主布局
 	content := container.NewVBox(
-		// 标题区域
-		container.NewPadded(title),
-		container.NewPadded(subtitle),
-		widget.NewSeparator(),
-
 		// 文件选择区域 - 始终显示卡片
 		container.NewPadded(fileCardContainer),
 		container.NewPadded(buttonBoxCentered),
+		widget.NewSeparator(),
+
+		// 模式选择区域
+		container.NewPadded(modeTitle),
+		container.NewPadded(modeBox),
 		widget.NewSeparator(),
 
 		// 进度区域
@@ -396,7 +411,20 @@ func processVideo(inputPath string) {
 		showError(fmt.Sprintf("获取视频帧率失败: %v", err))
 		return
 	}
-	fpsTarget := fpsOrigin * 2
+
+	// 根据模式计算目标帧率
+	var fpsTarget float64
+	var needFFMpegInterpolate bool // 是否需要FFmpeg补充插帧
+
+	if outputMode == "60fps" {
+		fpsTarget = 60.0
+		// 检查是否为整数倍关系
+		if fpsTarget/fpsOrigin != 2.0 && fpsTarget/fpsOrigin != 3.0 && fpsTarget/fpsOrigin != 4.0 {
+			needFFMpegInterpolate = true
+		}
+	} else {
+		fpsTarget = fpsOrigin * 2
+	}
 
 	updateProgress(fmt.Sprintf("帧率转换: %.0f -> %.0f", fpsOrigin, fpsTarget), 20)
 
@@ -426,17 +454,94 @@ func processVideo(inputPath string) {
 	// 4. RIFE 插帧
 	updateStep(stepInterpLabel, StepRunning, "AI 插帧")
 	updateProgress("AI 插帧中（这可能需要几分钟）...", 60)
+
+	// 自动计算最佳线程数（保留足够核心给系统）
+	numCPU := runtime.NumCPU()
+
+	// 保留给系统的核心数
+	var reservedCPU int
+	if numCPU <= 4 {
+		reservedCPU = 2  // 低端Mac保留2核
+	} else if numCPU <= 8 {
+		reservedCPU = 3  // 中端Mac保留3核
+	} else {
+		reservedCPU = 4  // 高端Mac保留4核
+	}
+
+	optimalThreads := numCPU - reservedCPU
+	if optimalThreads > 16 {
+		optimalThreads = 16 // 上限
+	}
+	if optimalThreads < 2 {
+		optimalThreads = 2 // 下限
+	}
+
 	if err := runCommand(paths.RIFE, []string{
 		"-i", filepath.Join(workDir, "in"),
 		"-o", filepath.Join(workDir, "out"),
-		"-j", "2:2:2",
+		"-j", fmt.Sprintf("%d:2:2", int(optimalThreads)),
 		"-m", paths.Model,
 	}); err != nil {
 		updateStep(stepInterpLabel, StepError, "AI 插帧")
 		showError(fmt.Sprintf("AI 插帧失败: %v", err))
 		return
 	}
-	updateStep(stepInterpLabel, StepCompleted, "AI 插帧")
+
+	// 如果需要FFmpeg补充插帧（非整数倍情况）
+	var finalFramePath string
+	if needFFMpegInterpolate {
+		updateProgress("正在补充帧率到60fps...", 70)
+
+		// 创建新的输出目录
+		out60Dir := filepath.Join(workDir, "out60")
+		if err := os.MkdirAll(out60Dir, 0755); err != nil {
+			updateStep(stepInterpLabel, StepError, "AI 插帧")
+			showError(fmt.Sprintf("创建输出目录失败: %v", err))
+			return
+		}
+
+		// 使用FFmpeg的minterpolate滤镜补充帧率
+		// 先将RIFE输出的PNG序列转换为中间视频
+		tempVideo := filepath.Join(workDir, "temp_rife.mp4")
+		rifeFrameRate := fpsOrigin * 2 // RIFE输出是2倍
+
+		if err := runCommand(paths.FFmpeg, []string{
+			"-y",
+			"-framerate", fmt.Sprintf("%.0f", rifeFrameRate),
+			"-i", filepath.Join(workDir, "out", "%08d.png"),
+			"-c:v", "libx264",
+			"-preset", "ultrafast", // 快速编码
+			"-crf", "18",
+			"-pix_fmt", "yuv420p",
+			tempVideo,
+		}); err != nil {
+			updateStep(stepInterpLabel, StepError, "AI 插帧")
+			showError(fmt.Sprintf("生成中间视频失败: %v", err))
+			return
+		}
+
+		// 使用minterpolate补充到60fps
+		if err := runCommand(paths.FFmpeg, []string{
+			"-y",
+			"-i", tempVideo,
+			"-filter:v", fmt.Sprintf("minterpolate=fps=60:mi_mode=mci:mc_mode=aobmc:me_mode=bidir_ref:vsbmc=1"),
+			"-c:v", "libx264",
+			"-preset", "ultrafast",
+			"-crf", "18",
+			"-pix_fmt", "yuv420p",
+			filepath.Join(out60Dir, "%08d.png"),
+		}); err != nil {
+			updateStep(stepInterpLabel, StepError, "AI 插帧")
+			showError(fmt.Sprintf("补充帧率失败: %v", err))
+			return
+		}
+
+		finalFramePath = out60Dir
+		updateStep(stepInterpLabel, StepCompleted, "AI 插帧 + 补充")
+	} else {
+		updateStep(stepInterpLabel, StepCompleted, "AI 插帧")
+		finalFramePath = filepath.Join(workDir, "out")
+	}
 
 	// 5. 合并视频
 	updateStep(stepMergeLabel, StepRunning, "合并视频")
@@ -451,7 +556,7 @@ func processVideo(inputPath string) {
 
 	if err := runCommand(paths.FFmpeg, []string{
 		"-y", "-framerate", fmt.Sprintf("%.0f", fpsTarget),
-		"-i", filepath.Join(workDir, "out", "%08d.png"),
+		"-i", filepath.Join(finalFramePath, "%08d.png"),
 		"-i", audioPath,
 		"-c:v", codec,
 		"-b:v", "15M",
