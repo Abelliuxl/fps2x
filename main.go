@@ -3,6 +3,7 @@ package main
 import (
 	"embed"
 	"fmt"
+	"image/color"
 	"log"
 	"os"
 	"os/exec"
@@ -13,6 +14,7 @@ import (
 
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/app"
+	"fyne.io/fyne/v2/canvas"
 	"fyne.io/fyne/v2/container"
 	"fyne.io/fyne/v2/dialog"
 	"fyne.io/fyne/v2/storage"
@@ -32,6 +34,26 @@ var (
 	fileLabel        *widget.Label
 	resultLabel      *widget.Label
 	mainWindow       fyne.Window
+
+	// 文件卡片元素
+	fileCardContainer *fyne.Container
+	fileNameLabel     *widget.Label
+	filePathLabel     *widget.Label
+	fileIconCanvas    *canvas.Text
+
+	// 步骤标签
+	stepExtractLabel *widget.Label
+	stepInterpLabel  *widget.Label
+	stepMergeLabel   *widget.Label
+)
+
+type ProcessingStep int
+
+const (
+	StepPending ProcessingStep = iota
+	StepRunning
+	StepCompleted
+	StepError
 )
 
 type DependencyCheck struct {
@@ -51,7 +73,7 @@ func main() {
 	myApp := app.NewWithID("com.fps2x.desktop")
 
 	mainWindow = myApp.NewWindow("FPS2X - 视频帧率倍增器")
-	mainWindow.Resize(fyne.NewSize(600, 500))
+	mainWindow.Resize(fyne.NewSize(600, 620))
 	mainWindow.CenterOnScreen()
 
 	// 创建 UI
@@ -71,60 +93,118 @@ func createUI() *fyne.Container {
 	title.Alignment = fyne.TextAlignCenter
 
 	subtitle := widget.NewLabel("视频帧率倍增器")
-	subTitleStyle := subtitle.TextStyle
-	subTitleStyle.Italic = true
-	subtitle.TextStyle = subTitleStyle
+	subtitle.TextStyle = fyne.TextStyle{Italic: true}
 	subtitle.Alignment = fyne.TextAlignCenter
 
-	// 文件选择区
+	// 文件状态卡片（大图标显示 - 4倍大小）
+	largeFontSize := float32(48) // 约4倍正常字体大小
+	fileIconCanvas = canvas.NewText("❓", color.White)
+	fileIconCanvas.TextSize = largeFontSize
+	fileIconCanvas.Alignment = fyne.TextAlignCenter
+
+	// 用container居中显示图标
+	fileIconCentered := container.NewCenter(fileIconCanvas)
+
+	fileNameLabel = widget.NewLabel("未选择文件")
+	fileNameLabel.Alignment = fyne.TextAlignCenter
+	fileNameLabel.TextStyle = fyne.TextStyle{Bold: true}
+
+	filePathLabel = widget.NewLabel("请选择要处理的视频文件")
+	filePathLabel.Alignment = fyne.TextAlignCenter
+	filePathLabel.Wrapping = fyne.TextWrapWord
+
+	fileCardContainer = container.NewVBox(
+		fileIconCentered,
+		container.NewPadded(fileNameLabel),
+		container.NewPadded(filePathLabel),
+	)
+
+	// 提示标签（保留但初始隐藏，在未选择文件时显示卡片）
 	fileLabel = widget.NewLabel("点击下方按钮选择视频文件")
 	fileLabel.Alignment = fyne.TextAlignCenter
 	fileLabel.Wrapping = fyne.TextWrapWord
+	fileLabel.Hide() // 现在始终显示卡片
 
+	// 按钮区域 - 横向布局但不占满宽度
 	selectBtn = widget.NewButton("选择视频文件", onSelectFile)
-
-	// 控制按钮
 	processBtn = widget.NewButton("开始处理", onProcessVideo)
 	processBtn.Disable()
 
-	// 进度条
+	buttonBox := container.NewHBox(
+		selectBtn,
+		processBtn,
+	)
+	// 居中对齐按钮
+	buttonBoxCentered := container.NewCenter(buttonBox)
+
+	// 进度区域
 	progressLabel = widget.NewLabel("准备就绪")
+	progressLabel.TextStyle = fyne.TextStyle{Bold: true}
 	progressBar = widget.NewProgressBar()
 	progressBar.SetValue(0)
 
+	// 处理步骤（使用更紧凑的布局）
+	stepTitle := widget.NewLabel("处理流程")
+	stepTitle.TextStyle = fyne.TextStyle{Bold: true}
+
+	stepExtractLabel = createStepLabel("⏳", "提取视频帧")
+	stepInterpLabel = createStepLabel("⏳", "AI 插帧")
+	stepMergeLabel = createStepLabel("⏳", "合并视频")
+
+	stepsBox := container.NewVBox(
+		stepExtractLabel,
+		widget.NewSeparator(),
+		stepInterpLabel,
+		widget.NewSeparator(),
+		stepMergeLabel,
+	)
+
+	// 状态和结果
 	statusLabel = widget.NewLabel("")
 	statusLabel.Wrapping = fyne.TextWrapWord
 	statusLabel.Alignment = fyne.TextAlignCenter
 
-	// 结果显示
 	resultLabel = widget.NewLabel("")
 	resultLabel.Wrapping = fyne.TextWrapWord
 	resultLabel.Alignment = fyne.TextAlignCenter
+	resultLabel.TextStyle = fyne.TextStyle{Bold: true}
 	resultLabel.Hide()
 
-	// 页脚
-	footer := widget.NewLabel("基于 RIFE AI 模型的视频插帧技术")
-	footer.Alignment = fyne.TextAlignCenter
-
-	// 布局
+	// 主布局
 	content := container.NewVBox(
+		// 标题区域
 		container.NewPadded(title),
 		container.NewPadded(subtitle),
 		widget.NewSeparator(),
-		container.NewPadded(fileLabel),
-		container.NewPadded(selectBtn),
-		container.NewPadded(processBtn),
+
+		// 文件选择区域 - 始终显示卡片
+		container.NewPadded(fileCardContainer),
+		container.NewPadded(buttonBoxCentered),
 		widget.NewSeparator(),
+
+		// 进度区域
 		container.NewPadded(progressLabel),
 		container.NewPadded(progressBar),
-		container.NewPadded(statusLabel),
-		container.NewPadded(resultLabel),
 		widget.NewSeparator(),
-		container.NewPadded(footer),
+
+		// 步骤区域
+		container.NewPadded(stepTitle),
+		container.NewPadded(stepsBox),
+		widget.NewSeparator(),
+
+		// 状态区域
+		statusLabel,
+		resultLabel,
 	)
 
-	scrollContainer := container.NewScroll(content)
-	return container.NewPadded(scrollContainer)
+	return container.NewPadded(content)
+}
+
+// 创建步骤标签，统一样式
+func createStepLabel(icon, text string) *widget.Label {
+	label := widget.NewLabel(fmt.Sprintf("%s  %s", icon, text))
+	label.TextStyle = fyne.TextStyle{Bold: true}
+	return label
 }
 
 func onSelectFile() {
@@ -147,8 +227,14 @@ func onSelectFile() {
 		}
 		filename := filepath.Base(selectedFilePath)
 
-		// 更新 UI
-		fileLabel.SetText(fmt.Sprintf("已选择: %s", filename))
+		// 更新 UI - 显示绿色勾号（4倍大小）
+		fileIconCanvas.Text = "✅"
+		fileIconCanvas.Color = color.RGBA{0, 200, 0, 255} // 绿色
+		fileIconCanvas.Refresh()
+
+		fileNameLabel.SetText(filename)
+		filePathLabel.SetText(selectedFilePath)
+
 		processBtn.Enable()
 	}, mainWindow)
 
@@ -166,9 +252,10 @@ func onProcessVideo() {
 	processBtn.Disable()
 	resultLabel.Hide()
 
-	// 重置进度
+	// 重置进度和步骤
 	progressBar.SetValue(0)
 	statusLabel.SetText("开始处理...")
+	resetSteps()
 
 	// 在后台处理视频
 	go processVideo(selectedFilePath)
@@ -324,16 +411,20 @@ func processVideo(inputPath string) {
 	}
 
 	// 3. 拆帧
+	updateStep(stepExtractLabel, StepRunning, "提取视频帧")
 	updateProgress("正在拆帧...", 40)
 	inputFrames := filepath.Join(workDir, "in", "%08d.jpg")
 	if err := runCommand(paths.FFmpeg, []string{
 		"-y", "-i", inputPath, "-q:v", "2", inputFrames,
 	}); err != nil {
+		updateStep(stepExtractLabel, StepError, "提取视频帧")
 		showError(fmt.Sprintf("拆帧失败: %v", err))
 		return
 	}
+	updateStep(stepExtractLabel, StepCompleted, "提取视频帧")
 
 	// 4. RIFE 插帧
+	updateStep(stepInterpLabel, StepRunning, "AI 插帧")
 	updateProgress("AI 插帧中（这可能需要几分钟）...", 60)
 	if err := runCommand(paths.RIFE, []string{
 		"-i", filepath.Join(workDir, "in"),
@@ -341,11 +432,14 @@ func processVideo(inputPath string) {
 		"-j", "2:2:2",
 		"-m", paths.Model,
 	}); err != nil {
+		updateStep(stepInterpLabel, StepError, "AI 插帧")
 		showError(fmt.Sprintf("AI 插帧失败: %v", err))
 		return
 	}
+	updateStep(stepInterpLabel, StepCompleted, "AI 插帧")
 
 	// 5. 合并视频
+	updateStep(stepMergeLabel, StepRunning, "合并视频")
 	updateProgress("正在封装最终视频...", 80)
 	outputPath := filepath.Join(downloadsPath, fmt.Sprintf("%s_%.0ffps.mp4", baseName, fpsTarget))
 
@@ -365,9 +459,11 @@ func processVideo(inputPath string) {
 		"-c:a", "copy",
 		"-shortest", outputPath,
 	}); err != nil {
+		updateStep(stepMergeLabel, StepError, "合并视频")
 		showError(fmt.Sprintf("封装视频失败: %v", err))
 		return
 	}
+	updateStep(stepMergeLabel, StepCompleted, "合并视频")
 
 	// 完成
 	updateProgress("处理完成！", 100)
@@ -422,6 +518,36 @@ func updateProgress(text string, progress float64) {
 		progressLabel.SetText(text)
 		progressBar.SetValue(progress / 100)
 	})
+}
+
+func updateStep(stepLabel *widget.Label, status ProcessingStep, stepName string) {
+	var icon string
+	var text string
+
+	switch status {
+	case StepPending:
+		icon = "⏳"
+		text = stepName
+	case StepRunning:
+		icon = "🔄"
+		text = fmt.Sprintf("正在%s...", stepName)
+	case StepCompleted:
+		icon = "✅"
+		text = fmt.Sprintf("%s完成", stepName)
+	case StepError:
+		icon = "❌"
+		text = fmt.Sprintf("%s失败", stepName)
+	}
+
+	fyne.Do(func() {
+		stepLabel.SetText(fmt.Sprintf("%s %s", icon, text))
+	})
+}
+
+func resetSteps() {
+	stepExtractLabel.SetText("⏳  提取视频帧")
+	stepInterpLabel.SetText("⏳  AI 插帧")
+	stepMergeLabel.SetText("⏳  合并视频")
 }
 
 func showError(message string) {
