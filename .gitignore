@@ -1,0 +1,37 @@
+# Binaries for programs and plugins
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Test binary, built with `go test -c`
+*.test
+
+# Output of the go coverage tool
+*.out
+
+# Go workspace file
+go.work
+
+# Build outputs
+build/
+dist/
+FPS2X.app
+fps2x
+
+# macOS system files
+.DS_Store
+._*
+
+# Temporary files
+tmp/
+temp/
+work_*/
+
+# IDE specific files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
