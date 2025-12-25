@@ -4,7 +4,6 @@ import (
 	"embed"
 	"fmt"
 	"image/color"
-	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -41,10 +40,13 @@ var (
 	filePathLabel     *widget.Label
 	fileIconCanvas    *canvas.Text
 
-	// 步骤标签
-	stepExtractLabel *widget.Label
-	stepInterpLabel  *widget.Label
-	stepMergeLabel   *widget.Label
+	// 步骤标签和进度条
+	stepExtractLabel    *widget.Label
+	stepExtractProgress *widget.ProgressBar
+	stepInterpLabel     *widget.Label
+	stepInterpProgress  *widget.ProgressBar
+	stepMergeLabel      *widget.Label
+	stepMergeProgress   *widget.ProgressBar
 
 	// 模式选择
 	outputMode       string // "2x" 或 "60fps"
@@ -140,17 +142,13 @@ func createUI() *fyne.Container {
 		modeSelect,
 	)
 
-	// 按钮区域 - 横向布局但不占满宽度
+	// 按钮区域
 	selectBtn = widget.NewButton("选择视频文件", onSelectFile)
+	selectBtnCentered := container.NewCenter(selectBtn)
+
 	processBtn = widget.NewButton("开始处理", onProcessVideo)
 	processBtn.Disable()
-
-	buttonBox := container.NewHBox(
-		selectBtn,
-		processBtn,
-	)
-	// 居中对齐按钮
-	buttonBoxCentered := container.NewCenter(buttonBox)
+	processBtnCentered := container.NewCenter(processBtn)
 
 	// 进度区域
 	progressLabel = widget.NewLabel("准备就绪")
@@ -162,16 +160,26 @@ func createUI() *fyne.Container {
 	stepTitle := widget.NewLabel("处理流程")
 	stepTitle.TextStyle = fyne.TextStyle{Bold: true}
 
+	// 创建每个步骤的标签和进度条
 	stepExtractLabel = createStepLabel("⏳", "提取视频帧")
-	stepInterpLabel = createStepLabel("⏳", "AI 插帧")
-	stepMergeLabel = createStepLabel("⏳", "合并视频")
+	stepExtractProgress = widget.NewProgressBar()
+	stepExtractProgress.SetValue(0)
 
+	stepInterpLabel = createStepLabel("⏳", "AI 插帧")
+	stepInterpProgress = widget.NewProgressBar()
+	stepInterpProgress.SetValue(0)
+
+	stepMergeLabel = createStepLabel("⏳", "合并视频")
+	stepMergeProgress = widget.NewProgressBar()
+	stepMergeProgress.SetValue(0)
+
+	// 将标签和进度条组合
 	stepsBox := container.NewVBox(
-		stepExtractLabel,
+		container.NewBorder(nil, nil, stepExtractLabel, stepExtractProgress),
 		widget.NewSeparator(),
-		stepInterpLabel,
+		container.NewBorder(nil, nil, stepInterpLabel, stepInterpProgress),
 		widget.NewSeparator(),
-		stepMergeLabel,
+		container.NewBorder(nil, nil, stepMergeLabel, stepMergeProgress),
 	)
 
 	// 状态和结果
@@ -189,7 +197,7 @@ func createUI() *fyne.Container {
 	content := container.NewVBox(
 		// 文件选择区域 - 始终显示卡片
 		container.NewPadded(fileCardContainer),
-		container.NewPadded(buttonBoxCentered),
+		selectBtnCentered,
 		widget.NewSeparator(),
 
 		// 模式选择区域
@@ -200,6 +208,7 @@ func createUI() *fyne.Container {
 		// 进度区域
 		container.NewPadded(progressLabel),
 		container.NewPadded(progressBar),
+		processBtnCentered,
 		widget.NewSeparator(),
 
 		// 步骤区域
@@ -404,13 +413,24 @@ func processVideo(inputPath string) {
 	}
 	defer os.RemoveAll(workDir) // 清理临时文件
 
-	// 1. 获取原始帧率
+	// 1. 获取原始帧率和分辨率
 	updateProgress("正在获取视频信息...", 10)
 	fpsOrigin, err := getFrameRate(inputPath, paths.FFprobe)
 	if err != nil {
 		showError(fmt.Sprintf("获取视频帧率失败: %v", err))
 		return
 	}
+
+	width, height, err := getVideoResolution(inputPath, paths.FFprobe)
+	if err != nil {
+		showError(fmt.Sprintf("获取视频分辨率失败: %v", err))
+		return
+	}
+
+	// 计算像素数量，用于判断是否为高分辨率
+	totalPixels := width * height
+	isHighRes := totalPixels > 1920*1080 // 超过1080p算高分辨率
+	is4K := totalPixels > 3840*2160*0.9 // 接近或超过4K
 
 	// 根据模式计算目标帧率
 	var fpsTarget float64
@@ -440,6 +460,7 @@ func processVideo(inputPath string) {
 
 	// 3. 拆帧
 	updateStep(stepExtractLabel, StepRunning, "提取视频帧")
+	updateStepProgress(stepExtractProgress, 0.1) // 开始
 	updateProgress("正在拆帧...", 40)
 	inputFrames := filepath.Join(workDir, "in", "%08d.jpg")
 	if err := runCommand(paths.FFmpeg, []string{
@@ -449,47 +470,65 @@ func processVideo(inputPath string) {
 		showError(fmt.Sprintf("拆帧失败: %v", err))
 		return
 	}
+	updateStepProgress(stepExtractProgress, 1.0) // 完成
 	updateStep(stepExtractLabel, StepCompleted, "提取视频帧")
 
 	// 4. RIFE 插帧
 	updateStep(stepInterpLabel, StepRunning, "AI 插帧")
+	updateStepProgress(stepInterpProgress, 0.1) // 开始
 	updateProgress("AI 插帧中（这可能需要几分钟）...", 60)
 
 	// 自动计算最佳线程数（保留足够核心给系统）
 	numCPU := runtime.NumCPU()
 
-	// 保留给系统的核心数
-	var reservedCPU int
-	if numCPU <= 4 {
-		reservedCPU = 2  // 低端Mac保留2核
-	} else if numCPU <= 8 {
-		reservedCPU = 3  // 中端Mac保留3核
-	} else {
-		reservedCPU = 4  // 高端Mac保留4核
-	}
+	// 根据分辨率调整线程策略
+	var loadThreads, procThreads, saveThreads int
 
-	optimalThreads := numCPU - reservedCPU
-	if optimalThreads > 16 {
-		optimalThreads = 16 // 上限
-	}
-	if optimalThreads < 2 {
-		optimalThreads = 2 // 下限
+	if is4K {
+		// 4K 视频：保守策略，避免显存溢出
+		// 只用少量线程，避免显存不足导致 swap
+		loadThreads = 2
+		procThreads = 4 // 4K用很少的处理线程
+		saveThreads = 2
+		updateProgress("检测到4K视频，使用保守线程设置以避免显存溢出", 50)
+	} else if isHighRes {
+		// 2K/1440p等高分辨率：中等策略
+		var reservedCPU int = 2
+		optimalThreads := numCPU - reservedCPU
+		if optimalThreads > 12 {
+			optimalThreads = 12
+		}
+		loadThreads = int(optimalThreads)
+		procThreads = int(optimalThreads) * 2 // 中等倍数
+		saveThreads = int(optimalThreads)
+	} else {
+		// 1080p及以下：激进策略，最大化性能
+		var reservedCPU int = 1
+		optimalThreads := numCPU - reservedCPU
+		if optimalThreads > 16 {
+			optimalThreads = 16
+		}
+		loadThreads = int(optimalThreads)
+		procThreads = int(optimalThreads) * 4 // 最大倍数
+		saveThreads = int(optimalThreads)
 	}
 
 	if err := runCommand(paths.RIFE, []string{
 		"-i", filepath.Join(workDir, "in"),
 		"-o", filepath.Join(workDir, "out"),
-		"-j", fmt.Sprintf("%d:2:2", int(optimalThreads)),
+		"-j", fmt.Sprintf("%d:%d:%d", loadThreads, procThreads, saveThreads),
 		"-m", paths.Model,
 	}); err != nil {
 		updateStep(stepInterpLabel, StepError, "AI 插帧")
 		showError(fmt.Sprintf("AI 插帧失败: %v", err))
 		return
 	}
+	updateStepProgress(stepInterpProgress, 0.8) // RIFE 完成，可能需要补充
 
 	// 如果需要FFmpeg补充插帧（非整数倍情况）
 	var finalFramePath string
 	if needFFMpegInterpolate {
+		updateStepProgress(stepInterpProgress, 0.9) // 开始补充
 		updateProgress("正在补充帧率到60fps...", 70)
 
 		// 创建新的输出目录
@@ -537,14 +576,17 @@ func processVideo(inputPath string) {
 		}
 
 		finalFramePath = out60Dir
+		updateStepProgress(stepInterpProgress, 1.0) // 完成
 		updateStep(stepInterpLabel, StepCompleted, "AI 插帧 + 补充")
 	} else {
+		updateStepProgress(stepInterpProgress, 1.0) // 完成
 		updateStep(stepInterpLabel, StepCompleted, "AI 插帧")
 		finalFramePath = filepath.Join(workDir, "out")
 	}
 
 	// 5. 合并视频
 	updateStep(stepMergeLabel, StepRunning, "合并视频")
+	updateStepProgress(stepMergeProgress, 0.1) // 开始
 	updateProgress("正在封装最终视频...", 80)
 	outputPath := filepath.Join(downloadsPath, fmt.Sprintf("%s_%.0ffps.mp4", baseName, fpsTarget))
 
@@ -568,6 +610,7 @@ func processVideo(inputPath string) {
 		showError(fmt.Sprintf("封装视频失败: %v", err))
 		return
 	}
+	updateStepProgress(stepMergeProgress, 1.0) // 完成
 	updateStep(stepMergeLabel, StepCompleted, "合并视频")
 
 	// 完成
@@ -606,13 +649,38 @@ func getFrameRate(inputPath, ffprobePath string) (float64, error) {
 	return parseFloat(fpsStr), nil
 }
 
-func runCommand(command string, args []string) error {
-	log.Printf("Running: %s %s", command, strings.Join(args, " "))
+func getVideoResolution(inputPath, ffprobePath string) (int, int, error) {
+	cmd := exec.Command(ffprobePath,
+		"-v", "error",
+		"-select_streams", "v:0",
+		"-show_entries", "stream=width,height",
+		"-of", "default=noprint_wrappers=1:nokey=1",
+		inputPath,
+	)
 
-	cmd := exec.Command(command, args...)
-	output, err := cmd.CombinedOutput()
+	output, err := cmd.Output()
 	if err != nil {
-		return fmt.Errorf("命令执行失败: %w\n输出: %s", err, string(output))
+		return 0, 0, fmt.Errorf("执行 ffprobe 失败: %w", err)
+	}
+
+	lines := strings.Split(strings.TrimSpace(string(output)), "\n")
+	if len(lines) >= 2 {
+		width := parseFloat(lines[0])
+		height := parseFloat(lines[1])
+		return int(width), int(height), nil
+	}
+
+	return 0, 0, fmt.Errorf("无法解析视频分辨率")
+}
+
+func runCommand(command string, args []string) error {
+	// 只记录命令，不捕获输出以减少内存占用
+	cmd := exec.Command(command, args...)
+
+	// 直接运行，不捕获输出（避免大量输出占用内存）
+	err := cmd.Run()
+	if err != nil {
+		return fmt.Errorf("命令执行失败: %w", err)
 	}
 
 	return nil
@@ -649,10 +717,19 @@ func updateStep(stepLabel *widget.Label, status ProcessingStep, stepName string)
 	})
 }
 
+func updateStepProgress(stepProgress *widget.ProgressBar, progress float64) {
+	fyne.Do(func() {
+		stepProgress.SetValue(progress)
+	})
+}
+
 func resetSteps() {
 	stepExtractLabel.SetText("⏳  提取视频帧")
+	stepExtractProgress.SetValue(0)
 	stepInterpLabel.SetText("⏳  AI 插帧")
+	stepInterpProgress.SetValue(0)
 	stepMergeLabel.SetText("⏳  合并视频")
+	stepMergeProgress.SetValue(0)
 }
 
 func showError(message string) {

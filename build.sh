@@ -8,6 +8,11 @@ VERSION=${VERSION:-"1.0.0"}
 BUILD_DIR="build"
 APP_NAME="FPS2X"
 
+# 设置 SDK 路径（macOS 需要）
+SDK_PATH=$(xcrun --sdk macosx --show-sdk-path)
+export CGO_CFLAGS="-isysroot $SDK_PATH"
+export CGO_LDFLAGS="-isysroot $SDK_PATH"
+
 echo "🚀 开始构建 FPS2X Go 版本..."
 
 # 清理旧的构建
@@ -41,6 +46,9 @@ case "$OS" in
         # 复制 binaries
         cp -r binaries "$APP_BUNDLE/Contents/Resources/"
 
+        # 复制图标
+        cp fps2x.icns "$APP_BUNDLE/Contents/Resources/"
+
         # 创建 Info.plist
         cat > "$APP_BUNDLE/Contents/Info.plist" << EOF
 <?xml version="1.0" encoding="UTF-8"?>
@@ -49,6 +57,8 @@ case "$OS" in
 <dict>
     <key>CFBundleExecutable</key>
     <string>$APP_NAME</string>
+    <key>CFBundleIconFile</key>
+    <string>fps2x.icns</string>
     <key>CFBundleIdentifier</key>
     <string>com.fps2x.desktop</string>
     <key>CFBundleName</key>
